@@ -1,0 +1,477 @@
+# Difficultés rencontrées — Projet OSSEC HIDS
+
+## 1. Confusion initiale autour de l’installation hybride
+
+### Problème rencontré
+
+Lors de l’installation du serveur OSSEC en mode hybride, une confusion est apparue concernant la notion d’agent local.
+
+Un agent supplémentaire a été ajouté manuellement sur le serveur avec l’adresse IP réseau du serveur. Cet agent apparaissait ensuite avec l’état :
+
+```text
+Never connected
+```
+
+Cela pouvait laisser penser que l’installation hybride ne fonctionnait pas.
+
+### Cause identifiée
+
+En réalité, dans une installation hybride, le serveur OSSEC surveille déjà sa propre machine via l’agent local intégré. Cette entrée peut apparaître sous la forme :
+
+```text
+ID: 000, Name: ossec-server (server), IP: 127.0.0.1, Active/Local
+```
+
+Il n’est donc pas nécessaire d’ajouter manuellement le serveur comme un agent distant avec son IP LAN.
+
+### Solution appliquée
+
+L’agent ajouté inutilement a été supprimé, puis l’architecture a été clarifiée :
+
+```text
+Serveur OSSEC        → serveur + agent local
+VM cliente OSSEC     → agent distant
+```
+
+### Enseignement
+
+L’entrée locale du serveur ne doit pas être confondue avec un agent distant. Le serveur OSSEC peut être supervisé localement sans être réenregistré comme agent réseau.
+
+---
+
+## 2. Mauvaise adresse IP utilisée pour un agent
+
+### Problème rencontré
+
+Un agent avait été ajouté avec une adresse du type :
+
+```text
+192.168.30.0
+```
+
+L’agent apparaissait avec l’état :
+
+```text
+Never connected
+```
+
+### Cause identifiée
+
+L’adresse `192.168.30.0` correspond généralement à l’adresse réseau d’un sous-réseau `/24`, et non à une adresse assignée à une machine.
+
+### Solution appliquée
+
+L’agent a été supprimé puis recréé avec l’adresse IP réelle de la VM cliente :
+
+```text
+192.168.30.101
+```
+
+La commande utilisée pour vérifier les agents était :
+
+```bash
+sudo /var/ossec/bin/agent_control -l
+```
+
+### Enseignement
+
+Lors de l’ajout d’un agent OSSEC, il faut renseigner l’adresse IP réelle de la machine cliente, pas l’adresse du réseau.
+
+---
+
+## 3. Absence du bloc Syscheck dans `ossec.conf`
+
+### Problème rencontré
+
+Le module Syscheck ne détectait pas les modifications de fichiers. Les logs OSSEC indiquaient :
+
+```text
+No directory provided for syscheck to monitor.
+Syscheck disabled.
+```
+
+### Cause identifiée
+
+Le fichier `/var/ossec/etc/ossec.conf` ne contenait pas de bloc `<syscheck>` valide. OSSEC démarrait le service `ossec-syscheckd`, mais aucun répertoire n’était surveillé.
+
+### Solution appliquée
+
+Un bloc `<syscheck>` a été ajouté dans le fichier de configuration :
+
+```xml
+<syscheck>
+  <frequency>300</frequency>
+  <scan_on_start>yes</scan_on_start>
+  <alert_new_files>yes</alert_new_files>
+
+  <directories check_all="yes" realtime="yes">/etc</directories>
+
+  <ignore type="sregex">\.(log|tmp|swp)$</ignore>
+</syscheck>
+```
+
+Puis OSSEC a été redémarré :
+
+```bash
+sudo /var/ossec/bin/ossec-control restart
+```
+
+### Enseignement
+
+Syscheck doit être explicitement configuré pour surveiller des répertoires. Sans répertoire défini, la surveillance d’intégrité des fichiers est inactive.
+
+---
+
+## 4. Trop grand volume d’alertes Syscheck
+
+### Problème rencontré
+
+Avec une fréquence trop courte et plusieurs répertoires surveillés, le fichier `alerts.log` contenait trop d’événements. Il devenait difficile d’identifier les alertes provenant de la VM cliente.
+
+### Cause identifiée
+
+Les répertoires `/bin` et `/usr/bin` génèrent beaucoup d’événements, notamment après installation de paquets ou lors du premier scan. Une fréquence de 60 secondes produisait également trop de bruit.
+
+### Solution appliquée
+
+La fréquence a été ajustée à 300 secondes :
+
+```xml
+<frequency>300</frequency>
+```
+
+Pendant les tests, seul le répertoire `/etc` a été surveillé :
+
+```xml
+<directories check_all="yes" realtime="yes">/etc</directories>
+```
+
+Les alertes ont ensuite été filtrées par agent :
+
+```bash
+sudo grep -i "client_agent" /var/ossec/logs/alerts/alerts.log | tail -n 50
+```
+
+ou par adresse IP :
+
+```bash
+sudo grep -i "192.168.30.101" /var/ossec/logs/alerts/alerts.log | tail -n 50
+```
+
+### Enseignement
+
+En laboratoire, il est préférable de réduire le périmètre surveillé pour obtenir des résultats lisibles. Une fréquence de 300 secondes offre un bon compromis entre réactivité et lisibilité.
+
+---
+
+## 5. Absence de `/var/log/auth.log` sur la VM cliente
+
+### Problème rencontré
+
+Les tentatives d’intrusion via `su` ou SSH ne généraient pas d’alertes OSSEC.
+
+### Cause identifiée
+
+Le fichier `/var/log/auth.log` n’existait pas sur la VM cliente. OSSEC ne pouvait donc pas collecter les événements d’authentification.
+
+### Solution appliquée
+
+Le service `rsyslog` a été installé et activé :
+
+```bash
+apt update
+apt install rsyslog -y
+systemctl enable rsyslog
+systemctl start rsyslog
+```
+
+Ensuite, le fichier a été vérifié :
+
+```bash
+ls -l /var/log/auth.log
+tail -n 30 /var/log/auth.log
+```
+
+Puis le bloc suivant a été ajouté dans `/var/ossec/etc/ossec.conf` côté client :
+
+```xml
+<localfile>
+  <log_format>syslog</log_format>
+  <location>/var/log/auth.log</location>
+</localfile>
+```
+
+### Enseignement
+
+OSSEC ne peut analyser que les logs existants et configurés. Pour détecter les échecs d’authentification, il faut s’assurer que `/var/log/auth.log` existe et qu’il est bien collecté par l’agent.
+
+---
+
+## 6. Détection des installations de paquets
+
+### Problème rencontré
+
+Les installations de paquets étaient détectées, mais pas les événements d’authentification.
+
+### Cause identifiée
+
+L’agent collectait uniquement le fichier suivant :
+
+```xml
+<localfile>
+  <log_format>syslog</log_format>
+  <location>/var/log/dpkg.log</location>
+</localfile>
+```
+
+Cela permettait de détecter les installations de paquets Debian, mais pas les connexions échouées.
+
+### Solution appliquée
+
+Les deux fichiers ont été configurés côté client :
+
+```xml
+<localfile>
+  <log_format>syslog</log_format>
+  <location>/var/log/auth.log</location>
+</localfile>
+
+<localfile>
+  <log_format>syslog</log_format>
+  <location>/var/log/dpkg.log</location>
+</localfile>
+```
+
+### Enseignement
+
+Chaque type d’événement doit être associé au bon fichier de log. `dpkg.log` sert aux paquets, tandis que `auth.log` sert aux authentifications.
+
+---
+
+## 7. Simulation de rootkit sans malware réel
+
+### Problème rencontré
+
+La simulation de rootkit ne générait pas d’alerte lorsque le faux fichier était placé dans :
+
+```text
+/usr/bin/.hidden/fake_rootkit
+```
+
+### Cause identifiée
+
+Le répertoire `/usr/bin` n’était pas toujours surveillé côté client. OSSEC ne pouvait donc pas détecter la création du fichier.
+
+### Solution appliquée
+
+Pour tester la simulation, deux options ont été utilisées :
+
+Option 1 : ajouter `/usr/bin` au bloc Syscheck côté client :
+
+```xml
+<directories check_all="yes" realtime="yes">/usr/bin</directories>
+```
+
+Option 2 : créer un faux rootkit dans `/etc`, déjà surveillé :
+
+```bash
+echo '#!/bin/bash' > /etc/fake_rootkit_test
+echo 'echo "simulation rootkit"' >> /etc/fake_rootkit_test
+chmod +x /etc/fake_rootkit_test
+```
+
+Puis rechercher l’alerte côté serveur :
+
+```bash
+sudo grep -i -A 6 -B 2 "fake_rootkit_test" /var/ossec/logs/alerts/alerts.log
+```
+
+### Enseignement
+
+Le test de rootkit doit rester contrôlé. Il n’est pas nécessaire d’installer un vrai rootkit. Un faux exécutable dans un répertoire sensible suffit à démontrer la détection d’un indicateur de compromission.
+
+---
+
+## 8. Grafana opérationnel mais dashboard Loki vide
+
+### Problème rencontré
+
+Grafana était accessible, Prometheus fonctionnait, mais le dashboard de récupération des logs OSSEC via Loki restait vide.
+
+### Cause identifiée
+
+Le problème pouvait se situer dans la chaîne suivante :
+
+```text
+OSSEC alerts.log → Promtail → Loki → Grafana
+```
+
+Les causes possibles étaient :
+
+- Promtail arrêté ;
+- mauvais chemin vers `alerts.log` ;
+- Loki non disponible ;
+- problème de permissions ;
+- mauvaise requête LogQL ;
+- mauvaise période temporelle dans Grafana.
+
+### Solution appliquée
+
+Vérification d’OSSEC :
+
+```bash
+sudo tail -n 50 /var/ossec/logs/alerts/alerts.log
+```
+
+Vérification de Promtail :
+
+```bash
+sudo systemctl status promtail
+sudo journalctl -u promtail -n 100 --no-pager
+```
+
+Vérification de Loki :
+
+```bash
+sudo systemctl status loki
+curl http://localhost:3100/ready
+```
+
+Vérification des labels Loki :
+
+```bash
+curl -G -s "http://localhost:3100/loki/api/v1/label/job/values"
+```
+
+### Enseignement
+
+Lorsque Grafana est vide, il ne faut pas diagnostiquer uniquement Grafana. Il faut vérifier toute la chaîne de collecte, de `alerts.log` jusqu’à Loki.
+
+---
+
+## 9. Intégration OSSEC avec Prometheus
+
+### Problème rencontré
+
+OSSEC ne fournit pas directement un endpoint compatible Prometheus.
+
+### Cause identifiée
+
+OSSEC produit principalement des logs, tandis que Prometheus attend des métriques exposées dans un format spécifique.
+
+### Solution proposée
+
+Un script personnalisé peut lire le fichier :
+
+```text
+/var/ossec/logs/alerts/alerts.log
+```
+
+Puis générer des métriques comme :
+
+```text
+ossec_alerts_total
+ossec_alerts_by_level
+ossec_alerts_by_agent
+ossec_alerts_by_category
+```
+
+Ces métriques peuvent ensuite être exposées avec le textfile collector de Node Exporter.
+
+### Enseignement
+
+L’intégration OSSEC/Prometheus nécessite une couche d’adaptation. Loki reste plus adapté pour consulter les logs bruts, tandis que Prometheus est utile pour les indicateurs chiffrés.
+
+---
+
+## 10. Gestion des services après redémarrage
+
+### Problème rencontré
+
+Après redémarrage du serveur, certains services comme Grafana ne fonctionnaient plus correctement.
+
+### Cause identifiée
+
+Certains services n’étaient pas activés automatiquement au démarrage.
+
+### Solution appliquée
+
+Les services ont été vérifiés :
+
+```bash
+sudo systemctl status grafana-server
+sudo systemctl status prometheus
+sudo systemctl status prometheus-node-exporter
+sudo systemctl status loki
+sudo systemctl status promtail
+```
+
+Puis activés au démarrage :
+
+```bash
+sudo systemctl enable grafana-server
+sudo systemctl enable prometheus
+sudo systemctl enable prometheus-node-exporter
+sudo systemctl enable loki
+sudo systemctl enable promtail
+```
+
+### Enseignement
+
+Un service qui fonctionne manuellement ne démarre pas forcément après reboot. L’activation avec `systemctl enable` est essentielle pour stabiliser le laboratoire.
+
+---
+
+## 11. Active Response : ne pas agir sur toutes les alertes
+
+### Problème rencontré
+
+L’idée initiale était de faire agir OSSEC sur chaque alerte.
+
+### Cause identifiée
+
+Déclencher une action automatique sur toutes les alertes est risqué. Une fausse alerte pourrait provoquer un blocage réseau, un redémarrage inutile ou une instabilité du système.
+
+### Solution recommandée
+
+Limiter Active Response à des alertes critiques ou à des règles précises :
+
+```xml
+<active-response>
+  <command>host-deny</command>
+  <location>local</location>
+  <level>10</level>
+  <timeout>600</timeout>
+</active-response>
+```
+
+Ou cibler un ID de règle spécifique :
+
+```xml
+<active-response>
+  <command>host-deny</command>
+  <location>local</location>
+  <rules_id>5712</rules_id>
+  <timeout>600</timeout>
+</active-response>
+```
+
+### Enseignement
+
+La réponse active doit être ciblée. En environnement SOC, l’automatisation doit réduire le risque, pas l’augmenter.
+
+---
+
+## Conclusion
+
+Les principales difficultés rencontrées concernaient la compréhension de l’architecture OSSEC, la configuration des agents, la collecte des bons fichiers de logs, le paramétrage de Syscheck et l’intégration avec les outils de visualisation.
+
+Ces problèmes ont permis de mieux comprendre le fonctionnement réel d’un HIDS :
+
+- un agent doit être correctement enregistré et actif ;
+- les fichiers de logs doivent exister et être collectés ;
+- Syscheck doit être configuré sur chaque machine à surveiller ;
+- Grafana, Loki et Prometheus ont des rôles complémentaires ;
+- la réponse active doit être utilisée avec prudence.
+
+Ce travail a permis de transformer un simple déploiement OSSEC en véritable laboratoire de détection, d’analyse et de supervision orienté SOC.
